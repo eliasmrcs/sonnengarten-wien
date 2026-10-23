@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sonnengarten Wien</title>
+  <meta name="description" content="Which Schanigarten in Vienna has sun right now?">
+  <meta name="theme-color" content="#f5a524">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="vendor/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header id="top">
+      <div class="searchrow">
+        <input id="search" type="search" placeholder="Search café, bar, street…" autocomplete="off" enterkeyhint="search">
+        <button id="locate" class="iconbtn" title="Use my location" aria-label="Use my location">
+          <svg viewBox="0 0 24 24" width="20" height="20"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="timerow">
+        <button id="now" class="chip active">Now</button>
+        <input id="slider" type="range" min="0" max="287" step="1" aria-label="Time of day">
+        <span id="timelabel" class="timelabel">--:--</span>
+        <input id="date" type="date" aria-label="Date">
+      </div>
+      <div id="weather" class="weather" hidden></div>
+    </header>
+
+    <div id="map"></div>
+
+    <section id="panel">
+      <div id="handle" aria-hidden="true"></div>
+      <div id="listview">
+        <div class="filters">
+          <button class="chip active" data-filter="sun">☀︎ Sunny now</button>
+          <button class="chip" data-filter="all">All</button>
+          <button class="chip" data-type="cafe">Cafés</button>
+          <button class="chip" data-type="bar">Bars</button>
+          <button class="chip" data-type="restaurant">Restaurants</button>
+        </div>
+        <div id="summary" class="summary"></div>
+        <ul id="list"></ul>
+      </div>
+      <div id="detail" hidden></div>
+    </section>
+  </div>
+  <script src="vendor/leaflet.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

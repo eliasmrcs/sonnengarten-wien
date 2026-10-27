@@ -13,6 +13,7 @@ two can be compared: sample points should be yellow where the ground is lit.
 import argparse
 import json
 import math
+from collections import Counter
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -96,6 +97,7 @@ def main():
     data = json.loads((P.OUT / "places.json").read_text())
     H = np.fromfile(P.OUT / "horizons.bin", np.uint8).reshape(-1, data["meta"]["azBins"], 3)
     k = int(round(az)) - data["meta"]["azMin"]
+    agree = Counter()
     for pl in data["places"]:
         for j, (plon, plat) in enumerate(pl["pts"]):
             px, py = P.from_wgs.transform(plon, plat)
@@ -106,8 +108,11 @@ def main():
             state = 0 if el <= hb[0] / 2 else (0.5 if hb[2] and hb[1] / 2 <= el <= hb[2] / 2 else 1)
             col = {1: (255, 150, 0), 0.5: (120, 160, 40), 0: (40, 60, 200)}[state]
             draw.ellipse([u - 5, v - 5, u + 5, v + 5], fill=col, outline=(255, 255, 255))
+            cast = lit[int(v // 2), int(u // 2)]
+            agree["same" if (cast > 0) == (state > 0) else "differs"] += 1
     im.save(out)
-    print(f"wrote {out}")
+    # sample points whose skyline verdict (sun/tree vs shade) matches the cast shadow map
+    print(f"wrote {out}; points {sum(agree.values())}, agree {agree['same']}, differ {agree['differs']}")
 
 
 if __name__ == "__main__":

@@ -373,8 +373,13 @@ def write_output(gardens, horizons):
     entries = []
     for key, gis in groups.items():
         gs = [gardens[i] for i in gis]
-        poi = gs[0]["poi"]
+        poi = next((g["poi"] for g in gs if g["poi"]), None)
         pts = [p for g in gs for p in g["samples"]]
+        blob = [h for gi in gis for h in horizons[gi]]
+        cap = getattr(C, "MAX_POINTS", None)
+        if cap and len(pts) > cap:  # big venues: spread the kept points over all their gardens
+            keep = np.unique(np.linspace(0, len(pts) - 1, cap).round().astype(int))
+            pts, blob = [pts[i] for i in keep], [blob[i] for i in keep]
         cx, cy = np.mean([g["x"] for g in gs]), np.mean([g["y"] for g in gs])
         lon, lat = to_wgs.transform(cx, cy)
         sample_ll = [to_wgs.transform(px, py) for px, py in pts]
@@ -394,7 +399,6 @@ def write_output(gardens, horizons):
             for k in ("cuisine", "hours", "web"):
                 if poi[k]:
                     place[k] = poi[k]
-        blob = [h for gi in gis for h in horizons[gi]]
         chunk = None
         if getattr(C, "CHUNK", None):
             chunk = (int(cx // C.CHUNK), int(cy // C.CHUNK))

@@ -23,6 +23,7 @@ TZ = "Europe/Paris"
 CENTER = (48.8566, 2.3522)
 POINT_ON_GARDEN = True            # terrace points sit on the terrace, not on the address
 CHUNK = 1000.0                    # horizons split into 1 km map chunks (Lambert 93 grid)
+MAX_POINTS = 10                   # sample points per place (big brasseries have up to 30)
 
 to_wgs = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True)
 from_wgs = Transformer.from_crs("EPSG:4326", CRS, always_xy=True)

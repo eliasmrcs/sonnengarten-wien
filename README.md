@@ -39,21 +39,40 @@ and find the nearest sunny spot from your location.
 
 ## Run it
 
+The pipeline is city-configurable: everything city-specific lives in
+`pipeline/cities/<city>.py` (sources, CRS, field mappings, name matching, garden
+placement); `process.py` is shared. Vienna is the default.
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install numpy shapely pillow pyproj
-.venv/bin/python pipeline/download.py     # ~600 MB into data/raw/
-.venv/bin/python pipeline/process.py      # writes app/data/
+.venv/bin/python pipeline/download.py                 # Vienna: ~600 MB into data/raw/
+.venv/bin/python pipeline/process.py                  # writes app/data/
+.venv/bin/python pipeline/download.py --city paris    # Paris: ~310 MB into data/raw/paris/
+.venv/bin/python pipeline/process.py --city paris     # writes app/data/paris/
 python3 -m http.server 8765 --directory app
 ```
 
-Then open http://localhost:8765.
+Then open http://localhost:8765. `process.py` runs the skyline step in parallel
+(`--workers N`, default: CPU cores − 1); Vienna takes ~100 s, Paris ~250 s on 8 cores.
+
+Paris output differs in one way: besides `horizons.bin`, the horizons are split
+into 1 km chunks (`app/data/paris/horizons/<id>.bin.gz`, listed in
+`places.json` → `meta.chunks`), because the whole file (26 MB) is too big for a
+phone. The data contract per place (`p0`, `n`, …) is the same. See
+`docs/paris-report.md` for sources, decisions and validation.
 
 To check the model visually, `pipeline/shadowmap.py` casts a shadow map for any
-spot and time and overlays what the app data says for each sample point:
+spot and time (local time of the city) and overlays what the app data says for
+each sample point; it also prints how many sample points agree with the cast map:
 
 ```bash
-cd pipeline && ../.venv/bin/python shadowmap.py 48.2114 16.3618 "2027-04-20 15:00" ../data/debug/out.png
-``` Location access needs HTTPS (or localhost),
+.venv/bin/python pipeline/shadowmap.py 48.2114 16.3618 "2027-04-20 15:00" data/debug/out.png
+.venv/bin/python pipeline/shadowmap.py --city paris 48.8541 2.3330 "2026-06-21 13:50" data/debug/flore.png
+```
+
+Location access needs HTTPS (or localhost),
 so put the `app/` folder on any static host (GitHub Pages, Netlify, Cloudflare
 Pages) to use it on your phone. Re-run the two pipeline scripts every few
-months to pick up new Schanigärten.
+months to pick up new Schanigärten and terraces.
+
+Data licences and attribution: see `LICENSES.md`.

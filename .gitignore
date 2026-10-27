@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 data/debug/
 data/process.log
+data/*.log
+data/stats-*.json

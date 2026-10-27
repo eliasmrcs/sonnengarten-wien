@@ -20,11 +20,13 @@ Outputs (the city's OUT folder; Vienna: app/data/, Paris: app/data/paris/):
   places.json   one entry per venue, with its sample-point range
   horizons.bin  per sample point, AZ_BINS x 3 bytes (building, tree low, tree high)
                 angles stored as round(deg * 2), tree bytes 0/0 = no tree
-  horizons/     (cities with CHUNK set) the same bytes split into map chunks,
-                listed in places.json meta.chunks, so phones load only what they show
+  horizons/     (cities with CHUNK set) the same bytes split into 1 km map chunks,
+                gzipped (<id>.bin.gz), listed in places.json meta.chunks
+                ({id, p0, points, bbox}), so phones load only what they show
 """
 
 import argparse
+import gzip
 import json
 import math
 import multiprocessing
@@ -355,6 +357,11 @@ def main():
     print("writing output…")
     write_output(gardens, horizons)
     print(f"done in {time.time() - t0:.0f}s")
+    if hasattr(C, "STATS"):  # numbers for the city report
+        stats = dict(C.STATS, placement=dict(Counter(g["placement"] for g in gardens)),
+                     points_per_garden=dict(sorted(Counter(len(g["samples"]) for g in gardens).items())),
+                     runtime_s=round(time.time() - t0), workers=args.workers)
+        (C.ROOT / "data" / f"stats-{C.NAME}.json").write_text(json.dumps(stats, indent=1, ensure_ascii=False))
 
 
 def write_output(gardens, horizons):
@@ -420,11 +427,13 @@ def write_output(gardens, horizons):
     if chunks:
         cdir = OUT / "horizons"
         cdir.mkdir(exist_ok=True)
-        for old in cdir.glob("*.bin"):
+        for old in cdir.glob("*.bin*"):
             old.unlink()
-        rows = AZ_BINS  # one sample point = AZ_BINS rows of 3 bytes
+        rows = AZ_BINS  # allh has AZ_BINS rows of 3 bytes per sample point
         for c in chunks:
-            allh[c["p0"] * rows:(c["p0"] + c["points"]) * rows].tofile(cdir / f"{c['id']}.bin")
+            # gzipped: static hosts rarely compress .bin; the app inflates with DecompressionStream
+            raw = allh[c["p0"] * rows:(c["p0"] + c["points"]) * rows].tobytes()
+            (cdir / f"{c['id']}.bin.gz").write_bytes(gzip.compress(raw, 9, mtime=0))
             del c["key"]
         meta["chunks"] = chunks
     (OUT / "places.json").write_text(json.dumps({"meta": meta, "places": places}, ensure_ascii=False,

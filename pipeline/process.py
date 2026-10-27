@@ -1,6 +1,8 @@
-"""Turn the raw open data into the app's data files.
+"""Turn a city's raw open data into the app's data files.
 
-For every Schanigarten we
+    .venv/bin/python pipeline/process.py [--city vienna|paris] [--workers N]
+
+For every garden / terrace we
   1. attach a name from OpenStreetMap (address match, else nearest venue),
   2. model the garden as a strip in front of the nearest façade and put a few
      sample points on it,
@@ -10,169 +12,51 @@ For every Schanigarten we
 
 The app then only needs the current sun position to decide sun / shade.
 
-Outputs (app/data/):
+Everything city-specific (sources, CRS, field mappings, name matching, garden
+size and placement rules) lives in pipeline/cities/<city>.py; from "list of
+gardens with x, y, area, kind, address" on, this file is shared.
+
+Outputs (the city's OUT folder; Vienna: app/data/, Paris: app/data/paris/):
   places.json   one entry per venue, with its sample-point range
   horizons.bin  per sample point, AZ_BINS x 3 bytes (building, tree low, tree high)
                 angles stored as round(deg * 2), tree bytes 0/0 = no tree
+  horizons/     (cities with CHUNK set) the same bytes split into map chunks,
+                listed in places.json meta.chunks, so phones load only what they show
 """
 
+import argparse
 import json
 import math
-import re
+import multiprocessing
 import time
-import unicodedata
-from collections import defaultdict
-from pathlib import Path
+from collections import Counter, defaultdict
 
 import numpy as np
 from PIL import Image, ImageDraw
-from pyproj import Transformer
 from shapely import STRtree, points, Point, Polygon, LineString, MultiLineString
 
-ROOT = Path(__file__).resolve().parent.parent
-RAW = ROOT / "data" / "raw"
-OUT = ROOT / "app" / "data"
+import cities
 
-AZ_MIN, AZ_MAX = 40, 320          # sun never rises north of ~50° in Vienna
+AZ_MIN, AZ_MAX = 40, 320          # sun never rises north of ~50° in Vienna or Paris
 AZ_BINS = AZ_MAX - AZ_MIN + 1     # 1° bins
 SUB_RAYS = 3                      # rays per bin (bin max over -0.33°, 0, +0.33°)
 RES = 0.5                         # raster resolution, metres
 MAX_DIST = 300.0                  # how far obstacles are considered, metres
 TILE = 400.0                      # processing tile size, metres
 EYE = 1.2                         # height above ground of a seated guest
-CONIFERS = ("pinus", "picea", "abies", "taxus", "thuja", "cedrus", "pseudotsuga",
-            "juniperus", "chamaecyparis", "larix", "sequoia", "metasequoia", "tsuga",
-            "cupressus", "ilex", "magnolia grandiflora")
 
-to_wgs = Transformer.from_crs("EPSG:31256", "EPSG:4326", always_xy=True)
-from_wgs = Transformer.from_crs("EPSG:4326", "EPSG:31256", always_xy=True)
+# set by configure(); module-level so shadowmap.py and worker processes see them
+C = RAW = OUT = to_wgs = from_wgs = None
 
 
-# ---------------------------------------------------------------- loading ---
-
-def load_features(name):
-    return json.loads((RAW / f"{name}.geojson").read_text())["features"]
-
-
-def load_buildings():
-    polys, top, ground = [], [], []
-    for f in load_features("buildings"):
-        p = f["properties"]
-        if p["O_KOTE"] is None or p["LAYER"] == "Telefonzelle":
-            continue
-        g = f["geometry"]
-        rings = [g["coordinates"]] if g["type"] == "Polygon" else g["coordinates"]
-        for r in rings:
-            if len(r[0]) < 4:
-                continue
-            poly = Polygon(r[0], r[1:])
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-            if poly.is_empty or poly.geom_type != "Polygon":
-                continue
-            polys.append(poly)
-            top.append(p["O_KOTE"])
-            ground.append(p["HOEHE_DGM"] if p["HOEHE_DGM"] is not None else p["T_KOTE"] or np.nan)
-    return polys, np.array(top, float), np.array(ground, float)
-
-
-# Baumkataster classes -> metres (class midpoints)
-TREE_HEIGHT = {1: 3.0, 2: 8.0, 3: 13.0, 4: 18.0, 5: 23.0, 6: 28.0, 7: 33.0, 8: 38.0}
-CROWN_DIAM = {1: 2.0, 2: 5.0, 3: 8.0, 4: 11.0, 5: 14.0, 6: 17.0, 7: 20.0, 8: 23.0}
-
-
-def load_trees():
-    xs, ys, h, d, ever = [], [], [], [], []
-    for f in load_features("trees"):
-        p = f["properties"]
-        hh = TREE_HEIGHT.get(p["BAUMHOEHE"])
-        dd = CROWN_DIAM.get(p["KRONENDURCHMESSER"])
-        if not hh or not dd:
-            continue
-        x, y = f["geometry"]["coordinates"][:2]
-        xs.append(x); ys.append(y); h.append(hh); d.append(dd)
-        art = (p["GATTUNG_ART"] or "").lower()
-        ever.append(art.startswith(CONIFERS))
-    return np.array(xs), np.array(ys), np.array(h), np.array(d), np.array(ever)
-
-
-def norm_street(s):
-    s = unicodedata.normalize("NFKC", (s or "").lower()).replace("ß", "ss")
-    s = re.sub(r"str\.?$", "strasse", s.strip())
-    s = re.sub(r"[^a-zäöü0-9]", "", s)
-    return s
-
-
-def first_number(s):
-    m = re.match(r"\s*(\d+)", str(s or ""))
-    return int(m.group(1)) if m else None
-
-
-def number_range(s):
-    """'12-14' -> {12, 13, 14}; '7a' -> {7}."""
-    nums = [int(n) for n in re.findall(r"\d+", str(s or ""))]
-    if not nums:
-        return set()
-    if len(nums) >= 2 and re.search(r"\d\s*[-–]\s*\d", str(s)) and nums[1] > nums[0] and nums[1] - nums[0] < 20:
-        return set(range(nums[0], nums[1] + 1))
-    return set(nums)
-
-
-def load_osm():
-    pois = []
-    for e in json.loads((RAW / "osm_pois.json").read_text())["elements"]:
-        t = e.get("tags", {})
-        if "name" not in t:
-            continue
-        lon, lat = (e["lon"], e["lat"]) if "lon" in e else (e["center"]["lon"], e["center"]["lat"])
-        x, y = from_wgs.transform(lon, lat)
-        pois.append({
-            "osm": f"{e['type'][0]}{e['id']}", "name": t["name"], "amenity": t.get("amenity"),
-            "x": x, "y": y, "street": norm_street(t.get("addr:street")),
-            "nums": number_range(t.get("addr:housenumber")),
-            "outdoor": t.get("outdoor_seating"), "cuisine": t.get("cuisine"),
-            "hours": t.get("opening_hours"), "web": t.get("website") or t.get("contact:website"),
-            "addr": " ".join(filter(None, [t.get("addr:street"), t.get("addr:housenumber")])),
-        })
-    return pois
-
-
-# --------------------------------------------------------------- matching ---
-
-def match_names(gardens, pois):
-    """Attach the most plausible OSM venue to each garden (or None)."""
-    tree = STRtree(points([(p["x"], p["y"]) for p in pois]))
-    for g in gardens:
-        idx = tree.query(Point(g["x"], g["y"]).buffer(120))
-        best, best_score = None, 0.0
-        for i in idx:
-            p = pois[i]
-            dist = math.hypot(p["x"] - g["x"], p["y"] - g["y"])
-            addr = p["street"] == g["street_n"] and g["onr"] in p["nums"]
-            street = p["street"] == g["street_n"]
-            if addr:
-                score = 100 - dist * 0.3
-            elif dist < 35:
-                score = 60 - dist + (10 if street else 0) - (15 if p["street"] and not street else 0)
-            else:
-                continue
-            if p["outdoor"] == "yes":
-                score += 8
-            elif p["outdoor"] == "no":
-                score -= 20
-            if p["amenity"] == "fast_food":
-                score -= 5
-            if score > best_score:
-                best, best_score = p, score
-        g["poi"] = best if best_score >= 25 else None
+def configure(city):
+    global C, RAW, OUT, to_wgs, from_wgs
+    C = cities.load(city)
+    RAW, OUT, to_wgs, from_wgs = C.RAW, C.OUT, C.to_wgs, C.from_wgs
+    return C
 
 
 # --------------------------------------------------------- garden shapes ---
-
-DEPTH = {"Gehsteig": 2.0, "Parkspur": 2.0, "Gehsteig und Parkspur": 4.0,
-         "Fußgänger/Begegnungszone": 4.0, "Begegnungszone": 4.0, "Privatgrund": 4.0,
-         "Gehsteig/Grünfläche": 3.0}
-
 
 def load_streets():
     """OSM street centrelines grouped by normalised name."""
@@ -182,25 +66,11 @@ def load_streets():
         if not geom or len(geom) < 2:
             continue
         xy = [from_wgs.transform(c["lon"], c["lat"]) for c in geom]
-        by_name[norm_street(e["tags"]["name"])].append(LineString(xy))
+        by_name[C.norm_street(e["tags"]["name"])].append(LineString(xy))
     global STREET_LINES, STREET_TREE
     STREET_LINES = [l for v in by_name.values() for l in v]
     STREET_TREE = STRtree(STREET_LINES)
     return {k: (MultiLineString(v) if len(v) > 1 else v[0]) for k, v in by_name.items()}
-
-
-def facade_offset(kind, d):
-    """Distance of the garden's centre line from the façade, given the façade
-    to street-centre distance d."""
-    if kind == "Parkspur":
-        return min(4.5, max(1.5, d - 2.5))
-    if kind == "Gehsteig und Parkspur":
-        return min(3.0, max(1.2, d * 0.45))
-    if kind in ("Fußgänger/Begegnungszone", "Begegnungszone", "Privatgrund"):
-        return min(2.5, max(1.2, d * 0.4))
-    if kind == "Gehsteig/Grünfläche":
-        return min(2.0, max(1.0, d * 0.4))
-    return min(1.2, max(0.6, d * 0.4))  # sidewalk
 
 
 def _inside(p, bpolys, btree):
@@ -227,9 +97,7 @@ def garden_samples(g, bpolys, btree, streets):
         if len(k):
             street = STREET_LINES[k[0]]
 
-    area = max(g["area"] or 10.0, 2.0)
-    depth = DEPTH.get(g["kind"], 2.5)
-    length = min(max(area / depth, 1.0), 40.0)
+    length = C.garden_length(g)
 
     if street is not None:
         line = street
@@ -258,11 +126,16 @@ def garden_samples(g, bpolys, btree, streets):
                 first = dist
             facade = ps + u * first
             normal = -u
-            center = facade + normal * facade_offset(g["kind"], first)
+            center = facade + normal * C.facade_offset(g, first)
             g["placement"] = ("fallback-" if g.get("placement") == "no-street" else "") + \
                 ("facade" if first < dist else "open")
             if first >= dist:  # address point is in the open: trust it
                 center = pr
+            elif getattr(C, "POINT_ON_GARDEN", False) and not _inside(pr, bpolys, btree):
+                # the city geocodes the garden itself (Paris): keep it, only
+                # orient the strip along the street
+                center = pr
+                g["placement"] = g["placement"].replace("facade", "as-given")
     else:
         tangent, normal, center = np.array([1.0, 0.0]), np.array([0.0, 1.0]), pr
 
@@ -400,16 +273,42 @@ def horizon_for_point(px, py, z0, x0, y0, size, hard, ttop, tbase):
 GROUND = None
 
 
+def _tile_horizons(item):
+    """Skylines for all gardens of one processing tile (runs in a worker)."""
+    (tx_, ty_), gis = item
+    bpolys, btop, btree, trees, ttree, gardens = _SHARED
+    x0, y0 = tx_ * TILE - MAX_DIST - 20, ty_ * TILE - MAX_DIST - 20
+    size = TILE + 2 * MAX_DIST + 40
+    hard, ttop, tbase = rasterize_tile(x0, y0, size, bpolys, btop, btree, trees, ttree)
+    out = {}
+    for gi in gis:
+        g = gardens[gi]
+        z0 = g["ground"] + EYE
+        out[gi] = [horizon_for_point(sx, sy, z0, x0, y0, size, hard, ttop, tbase)
+                   for sx, sy in g["samples"]]
+    return out
+
+
+_SHARED = None
+
+
 def main():
-    global GROUND
+    global GROUND, _SHARED
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--city", default="vienna", choices=cities.CITIES)
+    ap.add_argument("--workers", type=int, default=max(1, (multiprocessing.cpu_count() or 2) - 1))
+    args = ap.parse_args()
+    configure(args.city)
+
     t0 = time.time()
+    print(f"city: {C.NAME}")
     print("loading buildings…")
-    bpolys, btop, GROUND = load_buildings()
+    bpolys, btop, GROUND = C.load_buildings()
     btree = STRtree(bpolys)
     print(f"  {len(bpolys)} building parts ({time.time() - t0:.0f}s)")
 
     print("loading trees…")
-    tx, ty, th, td, tev = load_trees()
+    tx, ty, th, td, tev = C.load_trees()
     tpts = points(np.column_stack([tx, ty]))
     ttree = STRtree(tpts)
     nb = btree.query_nearest(tpts, max_distance=200, return_distance=False)
@@ -420,16 +319,9 @@ def main():
     print(f"  {len(tx)} trees, {tev.sum()} evergreen ({time.time() - t0:.0f}s)")
 
     print("loading gardens and venues…")
-    gardens = []
-    for f in load_features("schanigarten"):
-        p = f["properties"]
-        x, y = f["geometry"]["coordinates"][:2]
-        gardens.append({
-            "x": x, "y": y, "area": p["FLAECHE"], "kind": p["NAME"].replace("Schanigarten ", ""),
-            "street": p["STRASSE"], "street_n": norm_street(p["STRASSE"]), "onr": p["ONR"], "plz": p["PLZ"],
-        })
-    pois = load_osm()
-    match_names(gardens, pois)
+    gardens = C.load_gardens()
+    pois = C.load_pois()
+    C.match_names(gardens, pois)
     print(f"  {len(gardens)} gardens, {sum(1 for g in gardens if g['poi'])} matched to a venue")
 
     print("modelling garden shapes…")
@@ -438,25 +330,27 @@ def main():
         g["samples"], g["ground"] = garden_samples(g, bpolys, btree, streets)
         if np.isnan(g["ground"]):
             g["ground"] = float(np.nanmedian(GROUND))
-    from collections import Counter
     print("  placement:", dict(Counter(g["placement"] for g in gardens)))
 
-    print("computing skylines…")
+    print(f"computing skylines ({args.workers} workers)…")
     tiles = defaultdict(list)
     for gi, g in enumerate(gardens):
         tiles[(int(g["x"] // TILE), int(g["y"] // TILE))].append(gi)
+    items = sorted(tiles.items())
+    _SHARED = (bpolys, btop, btree, trees, ttree, gardens)
     horizons = {}
-    for k, ((tx_, ty_), gis) in enumerate(sorted(tiles.items())):
-        x0, y0 = tx_ * TILE - MAX_DIST - 20, ty_ * TILE - MAX_DIST - 20
-        size = TILE + 2 * MAX_DIST + 40
-        hard, ttop, tbase = rasterize_tile(x0, y0, size, bpolys, btop, btree, trees, ttree)
-        for gi in gis:
-            g = gardens[gi]
-            z0 = g["ground"] + EYE
-            horizons[gi] = [horizon_for_point(sx, sy, z0, x0, y0, size, hard, ttop, tbase)
-                            for sx, sy in g["samples"]]
-        if k % 10 == 0:
-            print(f"  tile {k + 1}/{len(tiles)} ({time.time() - t0:.0f}s)")
+    if args.workers > 1:
+        # fork: workers inherit the loaded data instead of pickling it
+        with multiprocessing.get_context("fork").Pool(args.workers) as pool:
+            for k, res in enumerate(pool.imap_unordered(_tile_horizons, items)):
+                horizons.update(res)
+                if k % 10 == 0:
+                    print(f"  tile {k + 1}/{len(items)} ({time.time() - t0:.0f}s)")
+    else:
+        for k, item in enumerate(items):
+            horizons.update(_tile_horizons(item))
+            if k % 10 == 0:
+                print(f"  tile {k + 1}/{len(items)} ({time.time() - t0:.0f}s)")
 
     print("writing output…")
     write_output(gardens, horizons)
@@ -464,13 +358,12 @@ def main():
 
 
 def write_output(gardens, horizons):
-    # group gardens into places: one per venue, or per address if unnamed
+    # group gardens into places: one per venue (rule per city)
     groups = defaultdict(list)
     for gi, g in enumerate(gardens):
-        key = ("osm", g["poi"]["osm"]) if g["poi"] else ("addr", g["street_n"], g["onr"])
-        groups[key].append(gi)
+        groups[C.place_key(g)].append(gi)
 
-    places, blobs, offset = [], [], 0
+    entries = []
     for key, gis in groups.items():
         gs = [gardens[i] for i in gis]
         poi = gs[0]["poi"]
@@ -479,33 +372,66 @@ def write_output(gardens, horizons):
         lon, lat = to_wgs.transform(cx, cy)
         sample_ll = [to_wgs.transform(px, py) for px, py in pts]
         place = {
-            "id": len(places),
-            "name": poi["name"] if poi else None,
-            "type": poi["amenity"] if poi else None,
-            "addr": f"{gs[0]['street']} {gs[0]['onr']}",
+            "id": None,
+            "name": poi["name"] if poi else gs[0].get("name"),
+            "type": poi["amenity"] if poi else gs[0].get("type"),
+            "addr": gs[0]["addr"],
             "plz": gs[0]["plz"],
             "lat": round(lat, 6), "lon": round(lon, 6),
             "area": round(sum(g["area"] or 0 for g in gs), 1),
             "kinds": sorted({g["kind"] for g in gs}),
-            "p0": offset, "n": len(pts),
+            "p0": None, "n": len(pts),
             "pts": [[round(a, 6), round(b, 6)] for a, b in sample_ll],
         }
         if poi:
             for k in ("cuisine", "hours", "web"):
                 if poi[k]:
                     place[k] = poi[k]
+        blob = [h for gi in gis for h in horizons[gi]]
+        chunk = None
+        if getattr(C, "CHUNK", None):
+            chunk = (int(cx // C.CHUNK), int(cy // C.CHUNK))
+        entries.append((chunk, place, blob))
+
+    if entries[0][0] is not None:
+        # places of one chunk are contiguous, so each chunk file is one p0 range
+        entries.sort(key=lambda e: e[0])
+
+    places, blobs, chunks, offset = [], [], [], 0
+    for chunk, place, blob in entries:
+        place["id"], place["p0"] = len(places), offset
+        if chunk is not None:
+            if not chunks or chunks[-1]["key"] != chunk:
+                chunks.append({"key": chunk, "id": f"{chunk[0]}_{chunk[1]}", "p0": offset, "points": 0,
+                               "bbox": [999.0, 999.0, -999.0, -999.0]})
+            c = chunks[-1]
+            c["points"] += place["n"]
+            for lon, lat in place["pts"]:
+                c["bbox"] = [min(c["bbox"][0], lon), min(c["bbox"][1], lat),
+                             max(c["bbox"][2], lon), max(c["bbox"][3], lat)]
         places.append(place)
-        for gi in gis:
-            blobs.extend(horizons[gi])
-        offset += len(pts)
+        blobs.extend(blob)
+        offset += place["n"]
 
     OUT.mkdir(parents=True, exist_ok=True)
     meta = {"azMin": AZ_MIN, "azBins": AZ_BINS, "generated": time.strftime("%Y-%m-%d"), "points": offset}
+    allh = np.concatenate(blobs).astype(np.uint8)
+    allh.tofile(OUT / "horizons.bin")
+    if chunks:
+        cdir = OUT / "horizons"
+        cdir.mkdir(exist_ok=True)
+        for old in cdir.glob("*.bin"):
+            old.unlink()
+        rows = AZ_BINS  # one sample point = AZ_BINS rows of 3 bytes
+        for c in chunks:
+            allh[c["p0"] * rows:(c["p0"] + c["points"]) * rows].tofile(cdir / f"{c['id']}.bin")
+            del c["key"]
+        meta["chunks"] = chunks
     (OUT / "places.json").write_text(json.dumps({"meta": meta, "places": places}, ensure_ascii=False,
                                                 separators=(",", ":")))
-    np.concatenate(blobs).astype(np.uint8).tofile(OUT / "horizons.bin")
     print(f"  {len(places)} places, {offset} sample points, "
-          f"horizons.bin {(OUT / 'horizons.bin').stat().st_size / 1e6:.1f} MB")
+          f"horizons.bin {(OUT / 'horizons.bin').stat().st_size / 1e6:.1f} MB"
+          + (f", {len(chunks)} chunks" if chunks else ""))
 
 
 if __name__ == "__main__":

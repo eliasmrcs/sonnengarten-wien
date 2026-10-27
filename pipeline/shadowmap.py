@@ -2,14 +2,17 @@
 garden sample points coloured by what the skyline data says.
 
     .venv/bin/python pipeline/shadowmap.py 48.2087 16.3700 "2026-10-23 14:00" out.png
+    .venv/bin/python pipeline/shadowmap.py --city paris 48.8540 2.3326 "2026-06-21 13:00" out.png
+
+Times are local to the city.
 
 The shadow map is cast directly (independent of the skyline data), so the
 two can be compared: sample points should be yellow where the ground is lit.
 """
 
+import argparse
 import json
 import math
-import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -39,8 +42,16 @@ def sun_position(dt, lat, lon):
 
 
 def main():
-    lat, lon, when, out = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3], sys.argv[4]
-    dt = datetime.strptime(when, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Europe/Vienna"))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--city", default="vienna")
+    ap.add_argument("lat", type=float)
+    ap.add_argument("lon", type=float)
+    ap.add_argument("when")
+    ap.add_argument("out")
+    a = ap.parse_args()
+    C = P.configure(a.city)
+    lat, lon, when, out = a.lat, a.lon, a.when, a.out
+    dt = datetime.strptime(when, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo(C.TZ))
     az, el = sun_position(dt, lat, lon)
     print(f"sun az {az:.1f}° el {el:.1f}°")
 
@@ -48,11 +59,10 @@ def main():
     half = 150
     x0, y0, size = cx - half - P.MAX_DIST, cy - half - P.MAX_DIST, 2 * (half + P.MAX_DIST)
 
-    bpolys, btop, P.GROUND = P.load_buildings_near(cx, cy, half + P.MAX_DIST + 50) \
-        if hasattr(P, "load_buildings_near") else P.load_buildings()
+    bpolys, btop, P.GROUND = C.load_buildings()
     from shapely import STRtree, points
     btree = STRtree(bpolys)
-    tx, ty, th, td, tev = P.load_trees()
+    tx, ty, th, td, tev = C.load_trees()
     ttree = STRtree(points(np.column_stack([tx, ty])))
     ground0 = float(np.nanmedian(P.GROUND[btree.query(P.Point(cx, cy).buffer(100))]))
     trees = (tx, ty, th, td, tev, np.full(len(tx), ground0))
